@@ -17,6 +17,8 @@ ELECTION_COOLDOWN     = 5              # Mínimo de segundos entre eleições
 ELECTION_UDP_PORT     = 5002           # Porta UDP para descoberta e broadcast
 MY_ELECTION_TCP       = 5003           # Porta TCP para comunicação P2P
 BROADCAST_ADDR        = "255.255.255.255"
+MASTER_HOST           = "127.0.0.1"
+MASTER_PORT           = 5000
 
 class WorkerNode:
     def __init__(self, port=MY_ELECTION_TCP):
@@ -25,6 +27,8 @@ class WorkerNode:
         self.worker_id = int(self.worker_uuid, 16)
         self.start_timestamp = time.time()  # MÉTODO DE DESEMPATE
         self.tcp_port = port
+        self.master_host = MASTER_HOST
+        self.master_port = MASTER_PORT
         
         self.running = True
         self.current_leader = None
@@ -250,8 +254,9 @@ class WorkerNode:
                     self._handle_discovery(msg, addr)
                 elif task == "DISCOVERY_OK":
                     peer_uuid = msg["WORKER_UUID"]
+                    peer_ts = msg.get("START_TIMESTAMP", time.time())
                     with self.peers_lock:
-                        self.peers[peer_uuid] = {"id": msg["WORKER_ID"], "ip": addr[0], "port": msg["LISTEN_PORT"]}
+                        self.peers[peer_uuid] = {"id": msg["WORKER_ID"], "ip": addr[0], "port": msg["LISTEN_PORT"], "start_timestamp": peer_ts}
                     self.log(f"Peer confirmado: {peer_uuid}")
                 elif task == "COORDINATOR":
                     self._handle_coordinator(msg)
@@ -307,6 +312,123 @@ class WorkerNode:
                 task_msg = {"TASK": "TASK_EXEC", "DATA": f"Query_{random.randint(100,999)}"}
                 self._send_tcp(target["ip"], target["port"], task_msg)
 
+    # ───────────────────────────────────────────────────────────
+    # CLIENT TCP para conexão com Master (apresentação / execução de tasks)
+    # ───────────────────────────────────────────────────────────
+
+    def _send_line(self, conn, payload: dict):
+        try:
+            data = json.dumps(payload) + "\n"
+            conn.sendall(data.encode())
+            return True
+        except Exception:
+            return False
+
+    def _master_client_loop(self, host=MASTER_HOST, port=MASTER_PORT):
+        while self.running:
+            try:
+                # always use instance-configured master host/port (tests set these on instance)
+                host = self.master_host
+                port = self.master_port
+
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(5)
+                    s.connect((host, port))
+                    s.settimeout(None)
+                    # Apresentação
+                    presentation = {
+                        "WORKER": "ALIVE",
+                        "WORKER_UUID": self.worker_uuid,
+                        "SERVER_UUID": None
+                    }
+                    self.log(f"Conectado ao Master {host}:{port} — apresentando-se {self.worker_uuid}")
+                    self._send_line(s, presentation)
+
+                    # iniciar heartbeat thread (envia HEARTBEAT periodicamente)
+                    def _hb_loop(sock):
+                        try:
+                            while self.running:
+                                hb = {"SERVER_UUID": self.worker_uuid, "TASK": "HEARTBEAT"}
+                                try:
+                                    self._send_line(sock, hb)
+                                except Exception:
+                                    break
+                                time.sleep(max(5, HEARTBEAT_INTERVAL))
+                        except Exception:
+                            pass
+
+                    threading.Thread(target=_hb_loop, args=(s,), daemon=True).start()
+
+                    # Loop de recebimento de mensagens delimitadas por \n
+                    buffer = b""
+                    while self.running:
+                        chunk = s.recv(4096)
+                        if not chunk:
+                            break
+                        buffer += chunk
+                        while b"\n" in buffer:
+                            line, buffer = buffer.split(b"\n", 1)
+                            try:
+                                msg = json.loads(line.decode())
+                            except Exception:
+                                continue
+
+                            task = msg.get("TASK")
+                            if task == "QUERY":
+                                self.log(f"Recebido TASK from Master: {msg.get('USER')}")
+                                # Simula processamento
+                                time.sleep(random.uniform(0.2, 1.0))
+                                status = {"STATUS": "OK", "TASK": "QUERY", "WORKER_UUID": self.worker_uuid}
+                                self._send_line(s, status)
+                                # aguardar ACK simples (bloqueante curto)
+                                try:
+                                    ack_buf = b""
+                                    # espera até 2 segundos por ACK
+                                    s.settimeout(2)
+                                    while b"\n" not in ack_buf:
+                                        chunk2 = s.recv(4096)
+                                        if not chunk2: break
+                                        ack_buf += chunk2
+                                    if b"\n" in ack_buf:
+                                        ack_line, _ = ack_buf.split(b"\n", 1)
+                                        try:
+                                            ack = json.loads(ack_line.decode())
+                                            if ack.get("STATUS") == "ACK":
+                                                self.log(f"ACK recebido do Master para {self.worker_uuid}")
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                                finally:
+                                    s.settimeout(None)
+                            elif task == "NO_TASK":
+                                # nada a fazer
+                                continue
+                            elif task == "TRANSFER_INSTRUCT":
+                                # instrução para conectar a novo master
+                                new_host = msg.get("HOST")
+                                new_port = msg.get("PORT")
+                                req_id = msg.get("REQUEST_ID")
+                                if new_host and new_port:
+                                    self.log(f"Instrução de transferência recebida: {new_host}:{new_port}")
+                                    # notificar master atual que vou transferir
+                                    try:
+                                        transfer_notice = {"TASK": "TRANSFER_COMPLETE", "WORKER_UUID": self.worker_uuid, "NEW_HOST": new_host, "NEW_PORT": new_port, "REQUEST_ID": req_id}
+                                        self._send_line(s, transfer_notice)
+                                    except Exception:
+                                        pass
+                                    # gravar novo master e encerrar conexão atual para reconectar
+                                    self.master_host = new_host
+                                    self.master_port = new_port
+                                    raise RuntimeError("TRANSFER")
+                    # conexão caiu — tentar reconectar
+            except Exception as e:
+                if isinstance(e, RuntimeError) and str(e) == "TRANSFER":
+                    # reinicia loop para conectar ao novo master imediatamente
+                    continue
+                self.log(f"Master connection error: {e}")
+                time.sleep(2)
+
     def start(self):
         self._setup_sockets()
         threading.Thread(target=self._udp_listener, daemon=True).start()
@@ -314,6 +436,7 @@ class WorkerNode:
         threading.Thread(target=self.heartbeat_loop, daemon=True).start()
         threading.Thread(target=self._monitor_leader_alive, daemon=True).start()
         threading.Thread(target=self._task_orchestrator_loop, daemon=True).start()
+        threading.Thread(target=self._master_client_loop, daemon=True).start()
         
         self.discovery_broadcast()
         time.sleep(1)
