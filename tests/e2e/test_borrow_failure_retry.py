@@ -68,10 +68,20 @@ class BrokenWorker(WorkerNode):
 
 
 def test_borrow_failure_rolls_back():
-    master_mod.MASTER_PEERS = [("127.0.0.1", 5000), ("127.0.0.1", 5003)]
+    import socket
+    def _free_port():
+        s = socket.socket()
+        s.bind(("", 0))
+        p = s.getsockname()[1]
+        s.close()
+        return p
 
-    m1 = MasterNode(host="127.0.0.1", port=5000)
-    m2 = MasterNode(host="127.0.0.1", port=5003)
+    p1 = _free_port()
+    p2 = _free_port()
+    master_mod.MASTER_PEERS = [("127.0.0.1", p1), ("127.0.0.1", p2)]
+
+    m1 = MasterNode(host="127.0.0.1", port=p1)
+    m2 = MasterNode(host="127.0.0.1", port=p2)
 
     start_master_in_thread(m1)
     start_master_in_thread(m2)
@@ -79,9 +89,9 @@ def test_borrow_failure_rolls_back():
     time.sleep(0.5)
 
     # start one broken worker attached to m2
-    w = BrokenWorker(port=6020)
+    w = BrokenWorker(port=_free_port())
     w.master_host = "127.0.0.1"
-    w.master_port = 5003
+    w.master_port = p2
     start_worker_in_thread(w)
 
     # wait for registration
