@@ -1,0 +1,84 @@
+================================================================================
+Test Run: 2026-05-18 20:58:55
+================================================================================
+
+
+### Testing: tests/tasks/ ###
+Return code: 0
+STDOUT:
+============================= test session starts =============================
+platform win32 -- Python 3.13.0, pytest-9.0.3, pluggy-1.6.0 -- C:\Program Files\Python313\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\miguel.araujo\Projeto-P2P-CEUB
+collecting ... collected 2 items
+
+tests/tasks/test_task01.py::test_task01_basic PASSED                     [ 50%]
+tests/tasks/test_task02.py::test_task02_integration PASSED               [100%]
+
+============================== 2 passed in 0.02s ==============================
+
+STDERR:
+
+
+### Testing: tests/e2e/test_e2e_basic.py ###
+Return code: 0
+STDOUT:
+============================= test session starts =============================
+platform win32 -- Python 3.13.0, pytest-9.0.3, pluggy-1.6.0 -- C:\Program Files\Python313\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\miguel.araujo\Projeto-P2P-CEUB
+collecting ... collected 1 item
+
+tests/e2e/test_e2e_basic.py::test_e2e_flow PASSED                        [100%]
+
+============================== 1 passed in 0.02s ==============================
+
+STDERR:
+
+
+### Testing: tests/e2e/test_borrow_flow.py ###
+Return code: 0
+STDOUT:
+============================= test session starts =============================
+platform win32 -- Python 3.13.0, pytest-9.0.3, pluggy-1.6.0 -- C:\Program Files\Python313\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\miguel.araujo\Projeto-P2P-CEUB
+collecting ... collected 1 item
+
+tests/e2e/test_borrow_flow.py::test_borrow_worker_flow PASSED            [100%]
+
+============================== 1 passed in 7.28s ==============================
+
+STDERR:
+
+
+### Testing: tests/e2e/test_borrow_failure_retry.py ###
+Return code: 0
+STDOUT:
+============================= test session starts =============================
+platform win32 -- Python 3.13.0, pytest-9.0.3, pluggy-1.6.0 -- C:\Program Files\Python313\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\miguel.araujo\Projeto-P2P-CEUB
+collecting ... collected 1 item
+
+tests/e2e/test_borrow_failure_retry.py::test_borrow_failure_rolls_back PASSED [100%]
+
+============================= 1 passed in 18.73s ==============================
+
+STDERR:
+
+
+### Testing: tests/e2e/test_borrow_pending.py ###
+Return code: 0
+STDOUT:
+============================= test session starts =============================
+platform win32 -- Python 3.13.0, pytest-9.0.3, pluggy-1.6.0 -- C:\Program Files\Python313\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\miguel.araujo\Projeto-P2P-CEUB
+collecting ... collected 1 item
+
+tests/e2e/test_borrow_pending.py::test_pending_borrow_recorded PASSED    [100%]
+
+============================== 1 passed in 6.73s ==============================
+
+STDERR:

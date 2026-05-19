@@ -29,6 +29,9 @@ class WorkerNode:
         self.tcp_port = port
         self.master_host = MASTER_HOST
         self.master_port = MASTER_PORT
+        # Rastrear master original para comando_release (Sprint 3)
+        self.original_master_host = None
+        self.original_master_port = None
         
         self.running = True
         self.current_leader = None
@@ -335,13 +338,18 @@ class WorkerNode:
                     s.settimeout(5)
                     s.connect((host, port))
                     s.settimeout(None)
-                    # Apresentação
+                    # Apresentação - se foi transferido, incluir SERVER_UUID do master original (host:port)
+                    server_uuid = None
+                    if self.original_master_host and self.original_master_port:
+                        server_uuid = f"{self.original_master_host}:{self.original_master_port}"
+                    
                     presentation = {
                         "WORKER": "ALIVE",
                         "WORKER_UUID": self.worker_uuid,
-                        "SERVER_UUID": None
+                        "SERVER_UUID": server_uuid
                     }
-                    self.log(f"Conectado ao Master {host}:{port} — apresentando-se {self.worker_uuid}")
+                    self.log(f"Conectado ao Master {host}:{port} — apresentando-se {self.worker_uuid}" + 
+                            (f" (emprestado de {server_uuid})" if server_uuid else " (local)"))
                     self._send_line(s, presentation)
 
                     # iniciar heartbeat thread (envia HEARTBEAT periodicamente)
@@ -405,12 +413,15 @@ class WorkerNode:
                                 # nada a fazer
                                 continue
                             elif task == "TRANSFER_INSTRUCT":
-                                # instrução para conectar a novo master
+                                # instrução para conectar a novo master (Sprint 2-3)
                                 new_host = msg.get("HOST")
                                 new_port = msg.get("PORT")
                                 req_id = msg.get("REQUEST_ID")
                                 if new_host and new_port:
                                     self.log(f"Instrução de transferência recebida: {new_host}:{new_port}")
+                                    # Guardar o master atual antes de transferir (para later return via command_release)
+                                    self.original_master_host = self.master_host
+                                    self.original_master_port = self.master_port
                                     # notificar master atual que vou transferir
                                     try:
                                         transfer_notice = {"TASK": "TRANSFER_COMPLETE", "WORKER_UUID": self.worker_uuid, "NEW_HOST": new_host, "NEW_PORT": new_port, "REQUEST_ID": req_id}
@@ -421,10 +432,31 @@ class WorkerNode:
                                     self.master_host = new_host
                                     self.master_port = new_port
                                     raise RuntimeError("TRANSFER")
+                            elif task == "command_release" or msg.get("type") == "command_release":
+                                # Instrução do Master para retornar ao master original (Sprint 3, seção 2.5.a)
+                                orig_addr = msg.get("payload", {}).get("original_master_address", "")
+                                if orig_addr and ":" in orig_addr:
+                                    parts = orig_addr.split(":")
+                                    try:
+                                        ret_host = parts[0]
+                                        ret_port = int(parts[1])
+                                        self.log(f"Recebido COMMAND_RELEASE: retornando a {ret_host}:{ret_port}")
+                                        # Reconectar ao master original
+                                        self.master_host = ret_host
+                                        self.master_port = ret_port
+                                        self.original_master_host = None  # Clear para evitar confusão
+                                        self.original_master_port = None
+                                        raise RuntimeError("RELEASE")  # Sinal para reconectar
+                                    except (ValueError, IndexError):
+                                        self.log(f"Erro ao parsear command_release: {orig_addr}")
                     # conexão caiu — tentar reconectar
             except Exception as e:
                 if isinstance(e, RuntimeError) and str(e) == "TRANSFER":
                     # reinicia loop para conectar ao novo master imediatamente
+                    continue
+                elif isinstance(e, RuntimeError) and str(e) == "RELEASE":
+                    # Liberado pelo master anterior, reconectar ao master original
+                    self.log("Liberado do master temporário, retornando ao master original")
                     continue
                 self.log(f"Master connection error: {e}")
                 time.sleep(2)

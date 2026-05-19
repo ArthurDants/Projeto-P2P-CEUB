@@ -13,12 +13,14 @@ MASTER_UUID = "Master_A"
 HOST = "0.0.0.0"
 PORT = 5000
 THRESHOLD = 5
+RELEASE_THRESHOLD = 2  # Histerese: libera workers quando carga cai abaixo disso
 TASK_INTERVAL = 4
 MASTER_PEERS = []
 LOG_DIR = "logs"
 LOG_FILE = f"{LOG_DIR}/tasks.log"
 PENDING_TTL = 8
 MAX_INSTRUCT_RETRIES = 2
+COMMAND_RELEASE_TIMEOUT = 3  # Timeout para enviar command_release
 
 
 class MasterNode:
@@ -41,6 +43,10 @@ class MasterNode:
         self.completed_log = []
         self.log_lock = threading.Lock()
         self.borrow_cooldowns = {}
+        
+        # workers_borrowed: {worker_uuid: {original_master_host, original_master_port, borrowed_from_host, borrowed_from_port}}
+        self.workers_borrowed = {}
+        self.borrowed_lock = threading.Lock()
 
     def _start_task_generator(self):
         def gen():
@@ -119,6 +125,28 @@ class MasterNode:
                             self.workers[worker_uuid] = {"conn": conn, "addr": addr, "borrowed_from": borrowed_from, "busy": False}
                         print(f"[WORKER] {worker_uuid} apresentado ({'EMPRESTADO' if borrowed_from else 'LOCAL'})")
                         print(f"[REGISTERED] Master {self.port} added worker {worker_uuid} — total={len(self.workers)}")
+                        
+                        # Se worker é emprestado, registrar em workers_borrowed para rastreamento (Sprint 3)
+                        if borrowed_from:
+                            # borrowed_from format expected: "host:port"
+                            orig_host = self.host
+                            orig_port = self.port
+                            if isinstance(borrowed_from, str) and ":" in borrowed_from:
+                                parts = borrowed_from.split(":", 1)
+                                orig_host = parts[0]
+                                try:
+                                    orig_port = int(parts[1])
+                                except Exception:
+                                    orig_port = self.port
+                            with self.borrowed_lock:
+                                self.workers_borrowed[worker_uuid] = {
+                                    "original_master_host": orig_host,
+                                    "original_master_port": orig_port,
+                                    "borrowed_from_host": addr[0],
+                                    "borrowed_from_port": addr[1]
+                                }
+                            print(f"[BORROWED] Worker {worker_uuid} rastreado para liberação posterior")
+                        
                         self._dispatch_task(conn, worker_uuid)
 
                     elif payload.get("STATUS") in ("OK", "NOK"):
@@ -179,6 +207,15 @@ class MasterNode:
                                 ok = self._send_line(info["conn"], instruct)
                                 if ok:
                                     acked.append(w_uuid)
+                                    # Registrar que este worker foi emprestado para rastrear na liberação (Sprint 3)
+                                    with self.borrowed_lock:
+                                        self.workers_borrowed[w_uuid] = {
+                                            "original_master_host": self.host,
+                                            "original_master_port": self.port,
+                                            "borrowed_from_host": from_host,
+                                            "borrowed_from_port": from_port,
+                                            "borrowed_from_uuid": from_uuid
+                                        }
                                 else:
                                     info.pop("borrowed_pending", None)
                             except Exception:
@@ -278,6 +315,72 @@ class MasterNode:
                             print(f"[BORROW-ERR] falha ao contatar {peer}: {e}")
             time.sleep(5)
 
+    def _release_saturation_loop(self):
+        """Monitora quando a carga normaliza e libera workers emprestados (command_release - Sprint 3)."""
+        while self.running:
+            load = self.task_queue.qsize()
+            
+            # Liberar workers quando carga < RELEASE_THRESHOLD (histerese para evitar oscilações)
+            if load < RELEASE_THRESHOLD:
+                to_release = []
+                with self.borrowed_lock:
+                    for w_uuid, borrow_info in list(self.workers_borrowed.items()):
+                        to_release.append((w_uuid, borrow_info))
+                
+                for w_uuid, borrow_info in to_release:
+                    with self.workers_lock:
+                        winfo = self.workers.get(w_uuid)
+                    
+                    if winfo and winfo.get("conn"):
+                        # Enviar COMMAND_RELEASE conforme Sprint 3, seção 2.5.a
+                        orig_host = borrow_info.get("original_master_host")
+                        orig_port = borrow_info.get("original_master_port")
+                        
+                        command = {
+                            "type": "command_release",
+                            "request_id": f"{self.port}-{int(time.time()*1000)}",
+                            "payload": {
+                                "original_master_address": f"{orig_host}:{orig_port}"
+                            }
+                        }
+                        
+                        try:
+                            if self._send_line(winfo["conn"], command):
+                                print(f"[RELEASE] Enviado COMMAND_RELEASE a {w_uuid} → {orig_host}:{orig_port}")
+                                
+                                # Remover do registro de workers
+                                with self.workers_lock:
+                                    self.workers.pop(w_uuid, None)
+                                with self.borrowed_lock:
+                                    self.workers_borrowed.pop(w_uuid, None)
+                                
+                                # Enviar notify_worker_returned conforme Sprint 3, seção 2.5.b
+                                self._notify_worker_returned(w_uuid, orig_host, orig_port, borrow_info)
+                            else:
+                                print(f"[RELEASE-ERR] Falha ao enviar COMMAND_RELEASE a {w_uuid}")
+                        except Exception as e:
+                            print(f"[RELEASE-ERR] {w_uuid}: {e}")
+            
+            time.sleep(3)  # Verificar a cada 3 segundos
+
+    def _notify_worker_returned(self, worker_id: str, orig_host: str, orig_port: int, borrow_info: dict):
+        """Notifica o master original que um worker emprestado foi devolvido (notify_worker_returned - Sprint 3)."""
+        try:
+            notification = {
+                "type": "notify_worker_returned",
+                "request_id": f"{self.port}-{int(time.time()*1000)}",
+                "payload": {
+                    "worker_id": worker_id,
+                    "original_master_address": f"{orig_host}:{orig_port}"
+                }
+            }
+            
+            with socket.create_connection((orig_host, orig_port), timeout=COMMAND_RELEASE_TIMEOUT) as s:
+                s.sendall((json.dumps(notification) + "\n").encode())
+                print(f"[NOTIFY] Worker {worker_id} devolvido a {orig_host}:{orig_port}")
+        except Exception as e:
+            print(f"[NOTIFY-ERR] Falha ao notificar {orig_host}:{orig_port}: {e}")
+
     def start(self):
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -286,6 +389,7 @@ class MasterNode:
         self.server_sock.settimeout(1)
 
         threading.Thread(target=self._monitor_saturation, daemon=True).start()
+        threading.Thread(target=self._release_saturation_loop, daemon=True).start()
         threading.Thread(target=self._pending_cleanup_loop, daemon=True).start()
 
         print(f"\n{'═'*55}")
