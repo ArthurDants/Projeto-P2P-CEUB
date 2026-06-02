@@ -1,3 +1,4 @@
+import argparse
 import socket
 import json
 import time
@@ -19,6 +20,7 @@ MY_ELECTION_TCP       = 5003           # Porta TCP para comunicação P2P
 BROADCAST_ADDR        = "255.255.255.255"
 MASTER_HOST           = "127.0.0.1"
 MASTER_PORT           = 5000
+MASTER_DISCOVERY_WAIT = 5
 
 class WorkerNode:
     def __init__(self, port=MY_ELECTION_TCP):
@@ -29,15 +31,22 @@ class WorkerNode:
         self.tcp_port = port
         self.master_host = MASTER_HOST
         self.master_port = MASTER_PORT
+        self.master_discovered = False
+        self.master_discovery_time = None
         # Rastrear master original para comando_release (Sprint 3)
         self.original_master_host = None
         self.original_master_port = None
+        # request_id recebido em command_redirect (Sprint 3)
+        self.redirect_request_id = None
         
         self.running = True
         self.current_leader = None
         self.leader_timestamp = 0
         self.heartbeat_failures = 0
         self.peers = {}  # {uuid: {"id": int, "ip": str, "port": int}}
+        self.last_master_no_task = False
+        # Timestamp do último heartbeat recebido do líder
+        self.last_heartbeat_time = time.time()
         
         # Estados: INITIALIZING, DISCOVERING, WAITING, FOLLOWING, ELECTING, LEADING
         self.state = "INITIALIZING"
@@ -76,11 +85,43 @@ class WorkerNode:
             self.log(f"Erro ao bind TCP na porta {self.tcp_port}: {e}")
             sys.exit(1)
 
-    def _send_udp(self, data, addr=BROADCAST_ADDR, port=ELECTION_UDP_PORT):
+    def _get_local_broadcast(self):
         try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            parts = ip.split(".")
+            if len(parts) == 4:
+                parts[-1] = "255"
+                return ".".join(parts)
+        except Exception:
+            pass
+        return BROADCAST_ADDR
+
+    def _send_udp(self, data, addr=BROADCAST_ADDR, port=ELECTION_UDP_PORT):
+        message = json.dumps(data).encode()
+        try:
+            if self.udp_sock:
+                self.udp_sock.sendto(message, (addr, port))
+                local_bcast = self._get_local_broadcast()
+                if local_bcast != addr:
+                    try:
+                        self.udp_sock.sendto(message, (local_bcast, port))
+                    except Exception:
+                        pass
+                return
+
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            sock.sendto(json.dumps(data).encode(), (addr, port))
+            sock.bind(('', ELECTION_UDP_PORT))
+            sock.sendto(message, (addr, port))
+            local_bcast = self._get_local_broadcast()
+            if local_bcast != addr:
+                try:
+                    sock.sendto(message, (local_bcast, port))
+                except Exception:
+                    pass
             sock.close()
         except Exception as e:
             self.log(f"Erro no envio UDP: {e}")
@@ -94,6 +135,28 @@ class WorkerNode:
                 return True
         except:
             return False
+
+    def _send_tcp_with_response(self, ip, port, data, timeout=2):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                s.connect((ip, port))
+                s.sendall((json.dumps(data) + "\n").encode())
+                buf = b""
+                while b"\n" not in buf:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                if b"\n" in buf:
+                    line, _ = buf.split(b"\n", 1)
+                    try:
+                        return json.loads(line.decode())
+                    except Exception:
+                        return None
+                return None
+        except Exception:
+            return None
 
     # ───────────────────────────────────────────────────────────
     # DESCOBERTA (Seção 3.2.2)
@@ -140,6 +203,20 @@ class WorkerNode:
         }
         self._send_udp(reply, addr=peer_ip)
 
+    def _handle_master_announce(self, msg, addr):
+        host = msg.get("HOST") or addr[0]
+        port = msg.get("PORT") or MASTER_PORT
+        try:
+            port = int(port)
+        except Exception:
+            port = MASTER_PORT
+        if host == "0.0.0.0":
+            host = addr[0]
+        self.master_host = host
+        self.master_port = port
+        self.master_discovered = True
+        self.log(f"Master descoberto em {host}:{port}")
+
     # ───────────────────────────────────────────────────────────
     # ALGORITMO BULLY (Seção 2)
     # ───────────────────────────────────────────────────────────
@@ -156,12 +233,8 @@ class WorkerNode:
         higher_peers = []
         with self.peers_lock:
             for uuid, info in self.peers.items():
-                # LÓGICA DE COMPARAÇÃO COM DESEMPATE:
-                # 1. ID maior vence.
-                # 2. Se ID igual, o Timestamp menor (mais antigo) vence.
                 is_higher = info["id"] > self.worker_id or \
                            (info["id"] == self.worker_id and info["start_timestamp"] < self.start_timestamp)
-                
                 if is_higher:
                     higher_peers.append(info)
         
@@ -169,7 +242,6 @@ class WorkerNode:
             self.become_leader()
             return
 
-        # Fase 1: Envia ELECTION para quem tem ID maior
         msg = {
             "TASK": "ELECTION",
             "WORKER_UUID": self.worker_uuid,
@@ -182,10 +254,8 @@ class WorkerNode:
                 received_ok = True
         
         if not received_ok:
-            # Fase 3: Ninguém respondeu, eu sou o Leader
             self.become_leader()
         else:
-            # Alguém com ID maior assumiu
             self.state = "WAITING"
             threading.Timer(ELECTION_TIMEOUT + 1, self._check_if_leader_elected).start()
 
@@ -216,6 +286,8 @@ class WorkerNode:
             self.current_leader = leader_uuid
             self.leader_timestamp = msg["TIMESTAMP"]
             self.heartbeat_failures = 0
+            # Resetar timestamp do último heartbeat ao reconhecer novo líder
+            self.last_heartbeat_time = time.time()
             if leader_uuid != self.worker_uuid:
                 self.state = "FOLLOWING"
         self.log(f"Reconhecido novo Leader: {leader_uuid}")
@@ -236,11 +308,17 @@ class WorkerNode:
             time.sleep(1)
             if self.state in ["FOLLOWING", "WAITING"]:
                 with self.lock:
-                    self.heartbeat_failures += 1
-                    if self.heartbeat_failures >= (HEARTBEAT_TIMEOUT * MAX_FAILURES):
-                        self.log(f"Leader {self.current_leader} inativo. Iniciando eleição.")
+                    # Se não houver líder conhecido, nada a checar
+                    if not self.current_leader:
+                        continue
+                    # Tempo desde o último heartbeat recebido
+                    elapsed = time.time() - getattr(self, 'last_heartbeat_time', 0)
+                    # Permitir um período tolerante baseado no intervalo de heartbeat + margem
+                    threshold = HEARTBEAT_INTERVAL + (HEARTBEAT_TIMEOUT * MAX_FAILURES)
+                    if elapsed > threshold:
+                        self.log(f"Leader {self.current_leader} inativo (timeout {int(elapsed)}s). Iniciando eleição.")
                         self.current_leader = None
-                        self.start_election()
+                        threading.Thread(target=self.start_election, daemon=True).start()
 
     # ───────────────────────────────────────────────────────────
     # LISTENERS
@@ -263,9 +341,13 @@ class WorkerNode:
                     self.log(f"Peer confirmado: {peer_uuid}")
                 elif task == "COORDINATOR":
                     self._handle_coordinator(msg)
+                elif task == "MASTER_ANNOUNCE":
+                    self._handle_master_announce(msg, addr)
                 elif task == "HEARTBEAT":
                     if msg["LEADER_UUID"] == self.current_leader:
                         with self.lock:
+                            # Atualiza timestamp do último heartbeat recebido
+                            self.last_heartbeat_time = time.time()
                             self.heartbeat_failures = 0
                         # Responde ao Leader (HEARTBEAT_OK)
                         reply = {"TASK": "HEARTBEAT_OK", "WORKER_UUID": self.worker_uuid}
@@ -297,8 +379,21 @@ class WorkerNode:
                 reply = {"TASK": "ELECTION_OK", "WORKER_UUID": self.worker_uuid}
                 conn.sendall(json.dumps(reply).encode())
                 threading.Thread(target=self.start_election, daemon=True).start()
-            elif task == "TASK_EXEC":
-                self.log(f"Processando tarefa: {msg.get('DATA')}")
+            elif task == "TASK_EXEC" or task == "QUERY":
+                # Normalize task payload: accept TASK_EXEC with DATA or QUERY with USER
+                user = msg.get("USER") or msg.get("DATA") or "<unknown>"
+                self.log(f"Processando tarefa: {user}")
+                # Simula processamento curto
+                try:
+                    time.sleep(random.uniform(0.1, 0.6))
+                except Exception:
+                    pass
+                # Responder com status semelhante ao Master
+                status = {"STATUS": "OK", "TASK": "QUERY", "WORKER_UUID": self.worker_uuid}
+                try:
+                    conn.sendall((json.dumps(status) + "\n").encode())
+                except Exception:
+                    pass
         except:
             pass
         finally:
@@ -306,14 +401,22 @@ class WorkerNode:
 
     def _task_orchestrator_loop(self):
         while self.running:
-            time.sleep(10)
+            time.sleep(2)  # enviar com frequência mais alta quando Lider
             if self.state == "LEADING":
                 with self.peers_lock:
-                    if not self.peers: continue
-                    target = random.choice(list(self.peers.values()))
-                
+                    # preparar lista de peers (uuid, info), excluindo a mim mesmo
+                    valid = [(uid, info) for uid, info in self.peers.items() if info.get("ip") and info.get("port") and uid != self.worker_uuid]
+
+                if not valid:
+                    self.log("Sou Leader, mas não há peers disponíveis para distribuir tarefas")
+                    continue
+
+                uid, target = random.choice(valid)
                 task_msg = {"TASK": "TASK_EXEC", "DATA": f"Query_{random.randint(100,999)}"}
-                self._send_tcp(target["ip"], target["port"], task_msg)
+                self.log(f"Leader enviando TASK_EXEC a {target['ip']}:{target['port']} (peer {uid}) — {task_msg['DATA']}")
+                ok = self._send_tcp(target["ip"], target["port"], task_msg)
+                if not ok:
+                    self.log(f"Falha ao enviar TASK_EXEC a {target['ip']}:{target['port']} (peer {uid})")
 
     # ───────────────────────────────────────────────────────────
     # CLIENT TCP para conexão com Master (apresentação / execução de tasks)
@@ -334,6 +437,19 @@ class WorkerNode:
                 host = self.master_host
                 port = self.master_port
 
+                discover_mode = host == "0.0.0.0" and not self.master_discovered
+                if discover_mode:
+                    if self.master_discovery_time is None:
+                        self.master_discovery_time = time.time()
+                    if time.time() - self.master_discovery_time < MASTER_DISCOVERY_WAIT:
+                        self.log("Tentando descobrir Master via UDP...")
+                        self.discovery_broadcast()
+                        time.sleep(1)
+                        continue
+                    self.log("Nenhum Master descoberto via UDP; iniciando eleição Bully")
+                    threading.Thread(target=self.start_election, daemon=True).start()
+                    return
+
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     s.settimeout(5)
                     s.connect((host, port))
@@ -351,6 +467,23 @@ class WorkerNode:
                     self.log(f"Conectado ao Master {host}:{port} — apresentando-se {self.worker_uuid}" + 
                             (f" (emprestado de {server_uuid})" if server_uuid else " (local)"))
                     self._send_line(s, presentation)
+
+                    # If we were redirected (Sprint 3), register as temporary worker at new master
+                    try:
+                        if self.original_master_host and self.redirect_request_id:
+                            reg = {
+                                "type": "register_temporary_worker",
+                                "request_id": self.redirect_request_id,
+                                "payload": {
+                                    "worker_id": self.worker_uuid,
+                                    "original_master_address": f"{self.original_master_host}:{self.original_master_port}"
+                                }
+                            }
+                            self._send_line(s, reg)
+                            # clear the redirect id after registration
+                            self.redirect_request_id = None
+                    except Exception:
+                        pass
 
                     # iniciar heartbeat thread (envia HEARTBEAT periodicamente)
                     def _hb_loop(sock):
@@ -382,7 +515,37 @@ class WorkerNode:
                                 continue
 
                             task = msg.get("TASK")
+                            # Sprint 3: handle master->master redirect command
+                            if msg.get("type") == "command_redirect" or task == "command_redirect":
+                                # payload contains new_master_address and original_master_address
+                                payload = msg.get("payload", {})
+                                addr = payload.get("new_master_address") or payload.get("new_host")
+                                req_id = msg.get("request_id") or msg.get("REQUEST_ID")
+                                if addr and ":" in addr:
+                                    parts = addr.split(":")
+                                    try:
+                                        new_h = parts[0]
+                                        new_p = int(parts[1])
+                                    except Exception:
+                                        continue
+                                    self.log(f"Instrução command_redirect recebida: {new_h}:{new_p}")
+                                    # guardar master atual antes de transferir
+                                    self.original_master_host = self.master_host
+                                    self.original_master_port = self.master_port
+                                    # store request id to use on register at new master
+                                    self.redirect_request_id = req_id
+                                    # inform current master (best-effort) about transfer
+                                    try:
+                                        transfer_notice = {"TASK": "TRANSFER_COMPLETE", "WORKER_UUID": self.worker_uuid, "NEW_HOST": new_h, "NEW_PORT": new_p, "REQUEST_ID": req_id}
+                                        self._send_line(s, transfer_notice)
+                                    except Exception:
+                                        pass
+                                    # set new master and trigger reconnect
+                                    self.master_host = new_h
+                                    self.master_port = new_p
+                                    raise RuntimeError("TRANSFER")
                             if task == "QUERY":
+                                self.last_master_no_task = False
                                 self.log(f"Recebido TASK from Master: {msg.get('USER')}")
                                 # Simula processamento
                                 time.sleep(random.uniform(0.2, 1.0))
@@ -410,7 +573,9 @@ class WorkerNode:
                                 finally:
                                     s.settimeout(None)
                             elif task == "NO_TASK":
-                                # nada a fazer
+                                if not self.last_master_no_task:
+                                    self.log("Master está sem tarefas no momento")
+                                    self.last_master_no_task = True
                                 continue
                             elif task == "TRANSFER_INSTRUCT":
                                 # instrução para conectar a novo master (Sprint 2-3)
@@ -459,7 +624,9 @@ class WorkerNode:
                     self.log("Liberado do master temporário, retornando ao master original")
                     continue
                 self.log(f"Master connection error: {e}")
+                self.log("Master inacessível; tentando reconectar sem iniciar eleição")
                 time.sleep(2)
+                continue
 
     def start(self):
         self._setup_sockets()
@@ -472,7 +639,7 @@ class WorkerNode:
         
         self.discovery_broadcast()
         time.sleep(1)
-        self.start_election()
+        self.master_discovery_time = time.time()
         
         self.log(f"Worker {self.worker_uuid} (ID: {self.worker_id}) rodando na porta {self.tcp_port}")
         try:
@@ -481,5 +648,18 @@ class WorkerNode:
             self.running = False
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else MY_ELECTION_TCP
-    WorkerNode(port=port).start()
+    parser = argparse.ArgumentParser(description="Worker node for P2P cluster")
+    parser.add_argument("--port", type=int, default=MY_ELECTION_TCP, help="TCP port for worker election and control")
+    parser.add_argument("--master-host", default=MASTER_HOST, help="Master host or IP address to connect to")
+    parser.add_argument("--master-port", type=int, default=MASTER_PORT, help="Master port to connect to")
+    args = parser.parse_args()
+
+    if args.master_host == "127.0.0.1":
+        print("WARNING: master-host is set to 127.0.0.1. If this worker is running on another machine, set --master-host to the Master's LAN IP.")
+    elif args.master_host == "0.0.0.0":
+        print("INFO: master-host 0.0.0.0 será tratado como descoberta UDP. O Worker aguardará o MASTER_ANNOUNCE para obter o IP real.")
+
+    worker = WorkerNode(port=args.port)
+    worker.master_host = args.master_host
+    worker.master_port = args.master_port
+    worker.start()

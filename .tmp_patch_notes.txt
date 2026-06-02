@@ -1,0 +1,5 @@
+Applying Sprint3 protocol updates:
+- master.py: add CAPACITY, implement request_help handler and response formats, update request_borrow to send `type` messages with payload and UUID request_id.
+- worker.py: send `register_temporary_worker` on redirected reconnect; handle `command_redirect` message to trigger transfer.
+
+Files modified: master.py, worker.py
