@@ -212,7 +212,7 @@ class MasterNode:
 
     def handle_worker(self, conn, addr):
         print(f"[CONEXÃO] Worker conectado de {addr}")
-        conn.settimeout(10)
+        conn.settimeout(60)
         conn_file = conn.makefile('rb')
         worker_uuid = None
         try:
@@ -458,7 +458,7 @@ class MasterNode:
                         if existing:
                             self._send_line(conn, {"TASK": "BORROW_RESPONSE", "STATUS": "ACCEPT", "NUM": len(existing.get("acked", [])), "REQUEST_ID": req_id})
                             continue
-
+                    
                         # select available workers
                         selected = []
                         with self.workers_lock:
@@ -516,6 +516,15 @@ class MasterNode:
                                 rec["acked"] = acked
 
                         self._send_line(conn, {"TASK": "BORROW_RESPONSE", "STATUS": "ACCEPT", "NUM": len(acked), "REQUEST_ID": req_id})
+                        continue
+                    elif payload.get("type") == "notify_worker_returned":
+                        inner = payload.get("payload", {})
+                        worker_id = inner.get("worker_id")
+                        print(f"[DEVOLUÇÃO] Master vizinho notificou que liberou o worker {worker_id}")
+                        # Limpa qualquer flag de pendência, pois o worker vai se reconectar via ALIVE
+                        with self.workers_lock:
+                            if worker_id in self.workers:
+                                self.workers[worker_id].pop("borrowed_pending", None)
                         continue
 
                     elif task == "TRANSFER_COMPLETE":
@@ -589,10 +598,11 @@ class MasterNode:
 
     def _dispatch_idle_workers(self):
         with self.workers_lock:
+            # Removido o filtro restrito de "protocol", agora todo worker disponível trabalha
             idle_workers = [
                 (w_uuid, info)
                 for w_uuid, info in self.workers.items()
-                if not info.get("busy") and info.get("conn") and info.get("protocol", "legacy") == "legacy"
+                if not info.get("busy") and info.get("conn")
             ]
             if not idle_workers:
                 return
@@ -607,7 +617,9 @@ class MasterNode:
                     break
 
                 try:
-                    self._send(info["conn"], task)
+                    # Envia a tarefa no formato esperado pela Sprint 2
+                    payload_tarefa = {"TASK": "QUERY", "USER": task.get("USER")}
+                    self._send_line(info["conn"], payload_tarefa)
                     info["busy"] = True
                     print(f"[DISPATCH] Tarefa enviada a {w_uuid}: USER={task.get('USER')}")
                     self.next_worker_index = (self.next_worker_index + 1) % len(self.workers) if self.workers else 0
