@@ -9,6 +9,9 @@ import queue
 import random
 import os
 import uuid
+import ssl
+import datetime
+import psutil
 
 # Basic configuration
 MASTER_UUID = "Master_A"
@@ -35,6 +38,7 @@ class MasterNode:
         self.port = port
         self.running = True
         self.server_sock = None
+        self.start_time = time.time()
 
         self.task_queue = queue.Queue()
         self._start_task_generator()
@@ -212,7 +216,7 @@ class MasterNode:
 
     def handle_worker(self, conn, addr):
         print(f"[CONEXÃO] Worker conectado de {addr}")
-        conn.settimeout(10)
+        conn.settimeout(60)
         conn_file = conn.makefile('rb')
         worker_uuid = None
         try:
@@ -458,7 +462,7 @@ class MasterNode:
                         if existing:
                             self._send_line(conn, {"TASK": "BORROW_RESPONSE", "STATUS": "ACCEPT", "NUM": len(existing.get("acked", [])), "REQUEST_ID": req_id})
                             continue
-
+                    
                         # select available workers
                         selected = []
                         with self.workers_lock:
@@ -516,6 +520,15 @@ class MasterNode:
                                 rec["acked"] = acked
 
                         self._send_line(conn, {"TASK": "BORROW_RESPONSE", "STATUS": "ACCEPT", "NUM": len(acked), "REQUEST_ID": req_id})
+                        continue
+                    elif payload.get("type") == "notify_worker_returned":
+                        inner = payload.get("payload", {})
+                        worker_id = inner.get("worker_id")
+                        print(f"[DEVOLUÇÃO] Master vizinho notificou que liberou o worker {worker_id}")
+                        # Limpa qualquer flag de pendência, pois o worker vai se reconectar via ALIVE
+                        with self.workers_lock:
+                            if worker_id in self.workers:
+                                self.workers[worker_id].pop("borrowed_pending", None)
                         continue
 
                     elif task == "TRANSFER_COMPLETE":
@@ -589,10 +602,11 @@ class MasterNode:
 
     def _dispatch_idle_workers(self):
         with self.workers_lock:
+            # Removido o filtro restrito de "protocol", agora todo worker disponível trabalha
             idle_workers = [
                 (w_uuid, info)
                 for w_uuid, info in self.workers.items()
-                if not info.get("busy") and info.get("conn") and info.get("protocol", "legacy") == "legacy"
+                if not info.get("busy") and info.get("conn")
             ]
             if not idle_workers:
                 return
@@ -607,7 +621,9 @@ class MasterNode:
                     break
 
                 try:
-                    self._send(info["conn"], task)
+                    # Envia a tarefa no formato esperado pela Sprint 2
+                    payload_tarefa = {"TASK": "QUERY", "USER": task.get("USER")}
+                    self._send_line(info["conn"], payload_tarefa)
                     info["busy"] = True
                     print(f"[DISPATCH] Tarefa enviada a {w_uuid}: USER={task.get('USER')}")
                     self.next_worker_index = (self.next_worker_index + 1) % len(self.workers) if self.workers else 0
@@ -725,6 +741,7 @@ class MasterNode:
         threading.Thread(target=self._monitor_saturation, daemon=True).start()
         threading.Thread(target=self._release_saturation_loop, daemon=True).start()
         threading.Thread(target=self._pending_cleanup_loop, daemon=True).start()
+        threading.Thread(target=self._supervisor_reporter_loop, daemon=True).start()
 
         print(f"\n{'═'*55}")
         print(f"  MASTER [{MASTER_UUID}] ONLINE — {self.host}:{self.port}")
@@ -842,6 +859,134 @@ class MasterNode:
                     self.pending_borrows.pop(req_id, None)
 
             time.sleep(2)
+    def _build_performance_payload(self):
+        # Cálculos de tempo e carga
+        uptime = int(time.time() - self.start_time)
+        try:
+            # Funciona nativamente de forma perfeita no Linux
+            load1, load5, _ = psutil.getloadavg()
+        except Exception:
+            load1, load5 = 0.0, 0.0
+
+        # Memória e Disco
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+
+        # Contagem de Workers e Farm State
+        with self.workers_lock:
+            total_registered = len(self.workers)
+            workers_busy = sum(1 for w in self.workers.values() if w.get("busy"))
+            workers_idle = total_registered - workers_busy
+            workers_received = sum(1 for w in self.workers.values() if w.get("borrowed_from"))
+            workers_home = total_registered - workers_received
+
+        with self.borrowed_lock:
+            workers_borrowed_count = len(self.workers_borrowed)
+            borrowed_list = []
+            # Direção OUT (Nós emprestamos para fora)
+            for w_uuid, info in self.workers_borrowed.items():
+                peer = f"{info.get('borrowed_from_host')}:{info.get('borrowed_from_port')}"
+                borrowed_list.append({"direction": "out", "peer_uuid": peer})
+
+        # Direção IN (Nós recebemos de fora)
+        with self.workers_lock:
+            for w_uuid, info in self.workers.items():
+                orig_master = info.get("borrowed_from")
+                if orig_master:
+                    borrowed_list.append({"direction": "in", "peer_uuid": str(orig_master)})
+
+        # Neighbors
+        neighbors = []
+        for peer in self.master_peers:
+            neighbors.append({
+                "server_uuid": f"{peer[0]}:{peer[1]}",
+                "status": "available",
+                "last_heartbeat": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            })
+
+        # Montagem do JSON no padrão rigoroso do Prof. Michel
+        payload = {
+            "server_uuid": MASTER_UUID,
+            "hostname": "arthur_lima1.farm.local",
+            "role": "master",
+            "task": "performance_report",
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "message_id": str(uuid.uuid4()),
+            "payload_version": "sprint4-monitor",
+            "performance": {
+                "system": {
+                    "uptime_seconds": uptime,
+                    "load_average_1m": round(load1, 2),
+                    "load_average_5m": round(load5, 2),
+                    "cpu": {
+                        "usage_percent": psutil.cpu_percent(interval=None),
+                        "count_logical": psutil.cpu_count(logical=True),
+                        "count_physical": psutil.cpu_count(logical=False)
+                    },
+                    "memory": {
+                        "total_mb": int(mem.total / (1024 * 1024)),
+                        "available_mb": int(mem.available / (1024 * 1024)),
+                        "percent_used": round(mem.percent, 2),
+                        "memory_used": int(mem.used / (1024 * 1024))
+                    },
+                    "disk": {
+                        "total_gb": round(disk.total / (1024**3), 2),
+                        "free_gb": round(disk.free / (1024**3), 2),
+                        "percent_used": disk.percent
+                    }
+                },
+                "farm_state": {
+                    "workers": {
+                        "total_registered": total_registered,
+                        "workers_utilization": workers_busy,
+                        "workers_alive": total_registered,
+                        "workers_idle": workers_idle,
+                        "workers_borrowed": workers_borrowed_count,
+                        "workers_received": workers_received,
+                        "workers_failed": 0,
+                        "workers_home": workers_home,
+                        "workers_available_capacity": workers_idle,
+                        "borrowed_workers": borrowed_list
+                    },
+                    "tasks": {
+                        "tasks_pending": self.task_queue.qsize(),
+                        "tasks_running": workers_busy,
+                        "tasks_completed": len(self.completed_log),
+                        "tasks_failed": 0,
+                        "oldest_task_age_s": 0 
+                    }
+                },
+                "config_thresholds": {
+                    "max_task": THRESHOLD,
+                    "warn_cpu_percent": 85,
+                    "warn_memory_percent": 85,
+                    "release_task": RELEASE_THRESHOLD
+                },
+                "neighbors": neighbors
+            }
+        }
+        return payload
+
+    def _supervisor_reporter_loop(self):
+        """Envia métricas a cada 10s via TLS/TCP para nuted-ia.dev sem aguardar recv."""
+        context = ssl.create_default_context()
+
+        while self.running:
+            try:
+                payload = self._build_performance_payload()
+                raw_data = (json.dumps(payload) + "\n").encode()
+
+                # Criando socket puro TCP e envelopando com TLS (Porta 443)
+                with socket.create_connection(("nuted-ia.dev", 443), timeout=5) as sock:
+                    with context.wrap_socket(sock, server_hostname="nuted-ia.dev") as ssock:
+                        ssock.sendall(raw_data)
+            except Exception as e:
+                # Silencioso para não poluir o terminal, ou você pode habilitar o print abaixo
+                # print(f"[SUPERVISOR] Falha ao enviar métricas: {e}")
+                pass
+            
+            # Requisito do documento: enviar a cada 10 segundos
+            time.sleep(10)
 
     def shutdown(self):
         print(f"\n[MASTER] Encerrando {MASTER_UUID}...")

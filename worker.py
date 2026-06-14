@@ -551,17 +551,18 @@ class WorkerNode:
                                 time.sleep(random.uniform(0.2, 1.0))
                                 status = {"STATUS": "OK", "TASK": "QUERY", "WORKER_UUID": self.worker_uuid}
                                 self._send_line(s, status)
-                                # aguardar ACK simples (bloqueante curto)
+
                                 try:
-                                    ack_buf = b""
-                                    # espera até 2 segundos por ACK
                                     s.settimeout(2)
-                                    while b"\n" not in ack_buf:
+                                    # Usa o buffer do loop principal para não perder pacotes colados!
+                                    while b"\n" not in buffer:
                                         chunk2 = s.recv(4096)
                                         if not chunk2: break
-                                        ack_buf += chunk2
-                                    if b"\n" in ack_buf:
-                                        ack_line, _ = ack_buf.split(b"\n", 1)
+                                        buffer += chunk2
+                                    
+                                    if b"\n" in buffer:
+                                        # Atualiza o buffer principal com a sobra (que pode ser a próxima TASK)
+                                        ack_line, buffer = buffer.split(b"\n", 1)
                                         try:
                                             ack = json.loads(ack_line.decode())
                                             if ack.get("STATUS") == "ACK":
@@ -572,6 +573,8 @@ class WorkerNode:
                                     pass
                                 finally:
                                     s.settimeout(None)
+                                # ==========================================
+                                
                             elif task == "NO_TASK":
                                 if not self.last_master_no_task:
                                     self.log("Master está sem tarefas no momento")
